@@ -1,0 +1,578 @@
+# === 00. IMPORTS === #
+import requests
+
+# === 01. Funções auxiliares de DataFrame === #
+def sanitizar_dataframe(df):
+    """
+    Função aprimorada para limpar o DataFrame de valores problemáticos.
+    - Remove valores NaN
+    - Substitui infinitos por valores máximos
+    - Normaliza colunas com valores extremos
+    
+    Parâmetros:
+        df (pandas.DataFrame): DataFrame a ser limpo
+        
+    Retorna:
+        pandas.DataFrame: DataFrame limpo
+    """
+    import pandas as pd
+    import numpy as np
+    
+    # Criar cópia para não modificar o original
+    df_limpo = df.copy()
+    
+    # Converter tudo para numérico (exceto timestamp)
+    for col in df_limpo.columns:
+        if col != 'timestamp':
+            df_limpo[col] = pd.to_numeric(df_limpo[col], errors='coerce')
+    
+    # Detectar colunas com valores infinitos
+    colunas_com_infinitos = []
+    for col in df_limpo.columns:
+        if col != 'timestamp' and np.isinf(df_limpo[col]).any():
+            colunas_com_infinitos.append(col)
+            # Substituir infinitos por valores grandes mas finitos
+            max_finito = np.nanmax(df_limpo[col][~np.isinf(df_limpo[col])])
+            min_finito = np.nanmin(df_limpo[col][~np.isinf(df_limpo[col])])
+            
+            # Substituir +inf pelo máximo finito * 1.5
+            mascara_pos_inf = np.isinf(df_limpo[col]) & (df_limpo[col] > 0)
+            if mascara_pos_inf.any():
+                df_limpo.loc[mascara_pos_inf, col] = max_finito * 1.5 if max_finito > 0 else 1e6
+            
+            # Substituir -inf pelo mínimo finito * 1.5
+            mascara_neg_inf = np.isinf(df_limpo[col]) & (df_limpo[col] < 0)
+            if mascara_neg_inf.any():
+                df_limpo.loc[mascara_neg_inf, col] = min_finito * 1.5 if min_finito < 0 else -1e6
+    
+    # Normalizar colunas com valores extremos
+    for col in df_limpo.columns:
+        if col != 'timestamp':
+            # Verificar se há valores extremos
+            q1 = df_limpo[col].quantile(0.25)
+            q3 = df_limpo[col].quantile(0.75)
+            iqr = q3 - q1
+            
+            # Limite para valores extremos
+            limite_superior = q3 + 3 * iqr
+            limite_inferior = q1 - 3 * iqr
+            
+            # Se há valores extremos, normalizar
+            extremos_superiores = (df_limpo[col] > limite_superior)
+            extremos_inferiores = (df_limpo[col] < limite_inferior)
+            
+            if extremos_superiores.sum() > 0 or extremos_inferiores.sum() > 0:
+                # Substituir extremos por limites
+                df_limpo.loc[extremos_superiores, col] = limite_superior
+                df_limpo.loc[extremos_inferiores, col] = limite_inferior
+    
+    # Remover NaNs
+    df_limpo = df_limpo.fillna(method='ffill').fillna(method='bfill').fillna(0)
+    
+    if colunas_com_infinitos:
+        print(f"⚠️ Substituídos valores infinitos nas colunas: {', '.join(colunas_com_infinitos)}")
+    
+    return df_limpo
+
+def calcular_indicadores(df, ativo, silencioso=True):
+    """
+    Calcula indicadores técnicos para um DataFrame de dados de preço.
+    
+    Args:
+        df: DataFrame com dados OHLCV
+        ativo: Nome do ativo para log
+        silencioso: Se True, suprime logs
+    
+    Returns:
+        DataFrame com indicadores adicionados
+    """
+    from ta.trend import EMAIndicator, MACD
+    from ta.momentum import RSIIndicator
+    from ta.volume import OnBalanceVolumeIndicator, VolumeWeightedAveragePrice
+    from ta.volatility import AverageTrueRange
+    from ta.trend import ADXIndicator
+    import pandas as pd
+    import numpy as np
+    
+    # === CÓDIGO DE VALIDAÇÃO INTEGRADO (substitui a chamada para validar_dados_binance) ===
+    if df is None or df.empty:
+        if not silencioso:
+            print(f"❌ Dados vazios ou nulos para {ativo}")
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    
+    # Verificar colunas essenciais
+    colunas_essenciais = ["open", "high", "low", "close", "volume"]
+    colunas_faltando = [col for col in colunas_essenciais if col not in df.columns]
+
+    if colunas_faltando and not silencioso:
+        print(f"⚠️ {ativo}: Colunas ausentes: {colunas_faltando}. Criando valores padrão...")
+    
+    # Adicionar colunas ausentes com valores padrão
+    for col in colunas_faltando:
+        df[col] = df["close"] if "close" in df.columns and col != "close" else 0.0
+    
+    # Converter tipos de dados
+    for col in colunas_essenciais:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Garantir que timestamp seja datetime
+    if "timestamp" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+    
+    # Ordenar por timestamp
+    if "timestamp" in df.columns:
+        df = df.sort_values("timestamp")
+    
+    # Remover duplicatas no timestamp se existir
+    if "timestamp" in df.columns:
+        df = df.drop_duplicates(subset=["timestamp"])
+    
+    # Remover linhas com NaN nas colunas essenciais
+    df = df.dropna(subset=colunas_essenciais)
+    
+    # Resetar índice
+    df = df.reset_index(drop=True)
+    
+    if len(df) < 26 and not silencioso:
+        print(f"⚠️ {ativo}: Apenas {len(df)} candles disponíveis. Indicadores podem ser imprecisos.")
+    # === FIM DO CÓDIGO DE VALIDAÇÃO INTEGRADO ===
+    
+    if df is None or df.empty or len(df) < 2:
+        return df
+    
+    try:
+        # Calcular indicadores básicos
+        df["EMA_9"] = EMAIndicator(close=df["close"], window=9).ema_indicator().fillna(0)
+        df["EMA_21"] = EMAIndicator(close=df["close"], window=21).ema_indicator().fillna(0)
+        df["RSI"] = RSIIndicator(close=df["close"], window=14).rsi().fillna(0)
+        df["OBV"] = OnBalanceVolumeIndicator(close=df["close"], volume=df["volume"]).on_balance_volume().fillna(0)
+
+        macd_calc = MACD(close=df["close"], window_slow=26, window_fast=12, window_sign=9)
+        df["MACD"] = macd_calc.macd().fillna(0)
+
+        vwap_calc = VolumeWeightedAveragePrice(
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            volume=df["volume"],
+            window=14
+        )
+        df["VWAP"] = vwap_calc.volume_weighted_average_price().fillna(0)
+        
+        # Adicionar indicadores adicionais (ATR e ADX)
+        df["ATR"] = AverageTrueRange(
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            window=14
+        ).average_true_range().fillna(0)
+        
+        adx_indicator = ADXIndicator(
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            window=14
+        )
+        df["ADX"] = adx_indicator.adx().fillna(0)
+
+    except Exception as e:
+        if not silencioso:
+            print(f"❌ ERRO ao calcular indicadores para {ativo}: {e}")
+            import traceback
+            print(traceback.format_exc())
+    
+    return df
+
+
+# === 02. Funções de regime/mercado e Telegram === # 
+def calcular_regime_mercado(df):
+    """
+    Determina o regime de mercado (TENDÊNCIA, LATERAL, ALTA_VOL, NEUTRO)
+    baseado em indicadores técnicos, com tratamento de dados melhorado.
+    
+    Parâmetros:
+        df (pandas.DataFrame): DataFrame com dados de mercado
+    
+    Retorna:
+        pandas.DataFrame: DataFrame original com coluna "Regime" adicionada
+    """
+    import numpy as np
+    import pandas as pd
+    
+    # Validação de entrada
+    if df is None or df.empty:
+        print("❌ DataFrame vazio em calcular_regime_mercado")
+        df_out = pd.DataFrame()
+        df_out["Regime"] = ["DESCONHECIDO"]
+        return df_out
+    
+    # Criar cópia para evitar modificar o original
+    df_out = df.copy()
+    
+    # Verificar colunas necessárias
+    colunas_necessarias = ["high", "low", "close"]
+    colunas_ausentes = [col for col in colunas_necessarias if col not in df_out.columns]
+    
+    if colunas_ausentes:
+        print(f"⚠️ Colunas necessárias ausentes: {colunas_ausentes}")
+        # Usar fallback se houver coluna 'close'
+        if 'close' in df_out.columns:
+            for col in colunas_ausentes:
+                df_out[col] = df_out['close']
+        else:
+            # Sem dados suficientes para calcular regime
+            df_out["Regime"] = "DESCONHECIDO"
+            return df_out
+    
+    # Verificar se há entradas suficientes
+    if len(df_out) < 15:
+        print(f"⚠️ Dados insuficientes para calcular regime: {len(df_out)} candles")
+        df_out["Regime"] = "LATERAL"  # Regime padrão com poucos dados
+        return df_out
+    
+    # Cálculo de ADX (Average Directional Index)
+    if "ADX" not in df_out.columns:
+        try:
+            from ta.trend import ADXIndicator
+            adx_indicator = ADXIndicator(
+                high=df_out["high"],
+                low=df_out["low"],
+                close=df_out["close"],
+                window=14,
+                fillna=True
+            )
+            df_out["ADX"] = adx_indicator.adx()
+        except Exception as e:
+            print(f"⚠️ Erro ao calcular ADX: {e}")
+            df_out["ADX"] = 15  # Valor padrão (regime LATERAL)
+    
+    # Cálculo de ATR (Average True Range)
+    if "ATR" not in df_out.columns:
+        try:
+            from ta.volatility import AverageTrueRange
+            atr_indicator = AverageTrueRange(
+                high=df_out["high"],
+                low=df_out["low"],
+                close=df_out["close"],
+                window=14,
+                fillna=True
+            )
+            df_out["ATR"] = atr_indicator.average_true_range()
+        except Exception as e:
+            print(f"⚠️ Erro ao calcular ATR: {e}")
+            df_out["ATR"] = 0  # Valor padrão (sem volatilidade)
+    
+    # Garantir que colunas ADX e ATR estão como números
+    df_out["ADX"] = pd.to_numeric(df_out["ADX"], errors="coerce").fillna(15)
+    df_out["ATR"] = pd.to_numeric(df_out["ATR"], errors="coerce").fillna(0)
+    
+    # Calcular média móvel do ATR
+    df_out["ATR_MA"] = df_out["ATR"].rolling(window=14, min_periods=1).mean()
+    
+    # Determinar regime com base nos indicadores
+    # 1. Primeiro determinar se é TENDÊNCIA ou LATERAL pelo ADX
+    df_out["Regime_ADX"] = np.where(
+        df_out["ADX"] > 30, "TENDÊNCIA",
+        np.where(df_out["ADX"] > 20, "NEUTRO", "LATERAL")
+    )
+    
+    # 2. Considerar volatilidade (ATR) para refinar o regime
+    # Volatilidade alta sobrepõe o regime, exceto se ADX for muito alto
+    df_out["Regime"] = np.where(
+        (df_out["ATR"] > df_out["ATR_MA"] * 1.3) & (df_out["ADX"] <= 35), "ALTA_VOL",
+        df_out["Regime_ADX"]
+    )
+    
+    # 3. Adicionar regra para evitar mudanças bruscas de regime
+    # (suavização para prevenir sinal de falso)
+    if len(df_out) > 5:
+        # Contar ocorrências de cada regime nas últimas 5 barras
+        ultimos_regimes = df_out["Regime"].iloc[-5:].value_counts()
+        regime_mais_comum = ultimos_regimes.idxmax() if not ultimos_regimes.empty else "LATERAL"
+        regime_atual = df_out["Regime"].iloc[-1]
+        
+        # Se o regime atual aparece apenas uma vez nas últimas 5 barras, 
+        # e é diferente do anterior, manter o anterior (suavização)
+        if ultimos_regimes.get(regime_atual, 0) <= 1 and regime_atual != df_out["Regime"].iloc[-2]:
+            df_out.loc[df_out.index[-1], "Regime"] = regime_mais_comum
+    
+    # Remover colunas auxiliares
+    df_out = df_out.drop(columns=["Regime_ADX", "ATR_MA"], errors="ignore")
+    
+    return df_out
+
+def enviar_mensagem_telegram(mensagem, nivel="info", consolidar=False, bypass_frequency=False):
+    """
+    Envia mensagem para o Telegram com controle de frequência e prioridade.
+    
+    Parâmetros:
+    - mensagem: Texto da mensagem
+    - nivel: "debug", "info", "importante", "alerta", "sinal"
+    - consolidar: Se True, adiciona ao buffer e envia depois
+    - bypass_frequency: Se True, ignora intervalo mínimo entre mensagens
+    """
+    import requests
+    import traceback
+    from datetime import datetime, timedelta
+
+    # 🔧 Configurações diretas (sem getenv)
+    TELEGRAM_BOT_TOKEN = '7812777606:AAG3uUTG6_aaV2Rjzx-Zaop69OWk7uiedik'
+    TELEGRAM_CHAT_ID = '-1002281646681'
+
+    # Inicializar variáveis globais
+    global ultima_mensagem_telegram, buffer_mensagens, contador_nivel
+
+    if 'ultima_mensagem_telegram' not in globals():
+        ultima_mensagem_telegram = {}
+        buffer_mensagens = {"modelos": [], "sistema": [], "sinais": []}
+        contador_nivel = {
+            "debug": 0, "info": 0, "importante": 0,
+            "alerta": 0, "sinal": 0
+        }
+
+    # ➕ Se consolidar, apenas adiciona ao buffer
+    if consolidar:
+        categoria = "sistema"
+        if "Modelo" in mensagem:
+            categoria = "modelos"
+        elif "Sinal" in mensagem:
+            categoria = "sinais"
+        buffer_mensagens[categoria].append({
+            "texto": mensagem,
+            "nivel": nivel,
+            "timestamp": datetime.now()
+        })
+        return
+
+    # ⏱️ Controle de frequência por nível
+    agora = datetime.now()
+    intervalos_minimos = {
+        "debug": timedelta(hours=12),
+        "info": timedelta(hours=4),
+        "importante": timedelta(hours=2),
+        "alerta": timedelta(minutes=30),
+        "sinal": timedelta(minutes=10)
+    }
+
+    if not bypass_frequency and nivel in ultima_mensagem_telegram:
+        tempo_desde_ultima = agora - ultima_mensagem_telegram[nivel]
+        if tempo_desde_ultima < intervalos_minimos[nivel]:
+            contador_nivel[nivel] += 1
+            return
+
+    # Prefixos para clareza no Telegram
+    prefixos = {
+        "debug": "🔍 DEBUG",
+        "info": "ℹ️ INFO",
+        "importante": "🔔 IMPORTANTE",
+        "alerta": "⚠️ ALERTA",
+        "sinal": "🚨 SINAL DE TRADING"
+    }
+
+    # Montar mensagem final
+    texto_final = f"{prefixos.get(nivel, '')}\n{mensagem}"
+    if contador_nivel[nivel] > 0:
+        texto_final += f"\n\n_+{contador_nivel[nivel]} mensagens similares ignoradas_"
+        contador_nivel[nivel] = 0
+
+    # Envio real com tratamento robusto
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": texto_final,
+            "parse_mode": "Markdown"
+        }
+        response = requests.post(url, data=data)
+        response.raise_for_status()
+        json_resp = response.json()
+
+        if not json_resp.get("ok"):
+            print("❌ Telegram retornou erro:", json_resp)
+        else:
+            print(f"✅ Mensagem enviada com sucesso. Nível: {nivel}")
+            ultima_mensagem_telegram[nivel] = agora
+
+    except Exception as e:
+        print(f"❌ [TELEGRAM] Erro ao enviar mensagem: {e}")
+        print(traceback.format_exc())
+
+def enviar_resumo_consolidado():
+    """Envia um resumo consolidado de todas as mensagens no buffer"""
+    # Verificar se há mensagens para enviar
+    total_mensagens = sum(len(msgs) for msgs in buffer_mensagens.values())
+    if total_mensagens == 0:
+        return
+    
+    mensagem = "*Resumo Consolidado do Sistema*\n\n"
+    
+    # Processar mensagens sobre modelos
+    if buffer_mensagens["modelos"]:
+        mensagem += "📊 *Atualizações de Modelos:*\n"
+        total_atualizados = len(buffer_mensagens["modelos"])
+        mensagem += f"- {total_atualizados} modelos atualizados\n"
+        # Incluir detalhes dos 3 mais recentes
+        for msg in buffer_mensagens["modelos"][-3:]:
+            # Extrair apenas a primeira linha para resumo
+            primeira_linha = msg["texto"].split("\n")[0]
+            mensagem += f"- {primeira_linha}\n"
+        if total_atualizados > 3:
+            mensagem += f"- _+{total_atualizados-3} outras atualizações_\n"
+    
+    # Processar sinais de trading
+    if buffer_mensagens["sinais"]:
+        mensagem += "\n📈 *Sinais de Trading:*\n"
+        for msg in buffer_mensagens["sinais"]:
+            # Extrair informações essenciais para sinais
+            linhas = msg["texto"].split("\n")
+            if len(linhas) > 2:
+                mensagem += f"- {linhas[1]} - {linhas[2]}\n"
+            else:
+                mensagem += f"- {msg['texto']}\n"
+    
+    # Processar mensagens do sistema
+    if buffer_mensagens["sistema"]:
+        mensagem += "\n⚙️ *Informações do Sistema:*\n"
+        # Agrupar por tipo de informação
+        num_otimizacoes = sum(1 for msg in buffer_mensagens["sistema"] if "otimiza" in msg["texto"].lower())
+        num_backtests = sum(1 for msg in buffer_mensagens["sistema"] if "backtest" in msg["texto"].lower())
+        
+        if num_otimizacoes > 0:
+            mensagem += f"- {num_otimizacoes} operações de otimização\n"
+        if num_backtests > 0:
+            mensagem += f"- {num_backtests} backtests realizados\n"
+    
+    # Limpar o buffer após envio
+    for categoria in buffer_mensagens:
+        buffer_mensagens[categoria] = []
+    
+    # Enviar a mensagem consolidada
+    enviar_mensagem_telegram(mensagem, nivel="importante")
+
+
+# === 03. Funções de notificação e métricas === # 
+def criar_metrica_composta(lucro, win_rate, max_drawdown, trades):
+    """
+    Cria uma métrica composta que equilibra retorno, risco e consistência
+    
+    Args:
+        lucro: Lucro total da simulação
+        win_rate: Taxa de acertos (0-1)
+        max_drawdown: Drawdown máximo durante a simulação (%)
+        trades: Número total de trades
+    
+    Returns:
+        float: Pontuação composta (mais alta = melhor)
+    """
+    # Converter para valores normalizados
+    lucro_norm = min(1.0, max(0, lucro / 200.0))  # Normalizar para 200 de lucro máximo
+    wr_norm = win_rate  # Já está entre 0-1
+    
+    # Penalizar drawdown severo (menor = melhor)
+    if max_drawdown <= 0:
+        dd_norm = 1.0  # Sem drawdown é ótimo
+    else:
+        dd_norm = max(0, 1.0 - (max_drawdown / 50.0))  # 50% de drawdown = 0 pontos
+    
+    # Bônus para número suficiente de trades (confiabilidade estatística)
+    if trades < 5:
+        trade_factor = 0.5  # Penalizar modelos com poucos trades
+    elif trades < 10:
+        trade_factor = 0.8  # Aceitável mas não ideal
+    else:
+        trade_factor = 1.0  # Bom número de trades
+    
+    # Cálculo da métrica composta
+    # 40% peso para lucro, 25% para win rate, 25% para drawdown, 10% para número de trades
+    metrica = (0.4 * lucro_norm + 0.25 * wr_norm + 0.25 * dd_norm) * trade_factor
+    
+    return metrica
+
+def notificar_modelo_carregado(ativo, intervalo, taxa_acerto, indicadores):
+    """
+    Envia uma notificação ao Telegram quando um novo modelo é carregado.
+    """
+    try:
+        # Se tiver mais de 3 indicadores, exibe apenas os 3 primeiros por brevidade
+        indicadores_resumo = indicadores[:3]
+        if len(indicadores) > 3:
+            indicadores_resumo = indicadores_resumo + ["..."]
+        
+        mensagem = f"""
+📊 *Modelo Carregado*
+- Ativo: {ativo}
+- Intervalo: {intervalo}
+- Precisão: {taxa_acerto:.2f}%
+- Indicadores: {', '.join(indicadores_resumo if indicadores_resumo else ['N/A'])}
+"""
+        enviar_mensagem_telegram(mensagem, nivel="info")
+    except Exception as e:
+        print(f"⚠️ Erro ao notificar carregamento de modelo: {e}")
+    
+# === 04. Funções de execução compartilhadas === #
+def executar_pipeline_modelo(modelo, scaler, X, indicadores_esperados, min_confianca=0.55):
+    """
+    Executa o pipeline do modelo treinado com consistência com o backtest.
+    - Garante ordem, presença e formato das colunas esperadas.
+    - Aplica o scaler (se disponível).
+    - Retorna previsão (compra/venda) e probabilidade.
+
+    Parâmetros:
+        modelo: Modelo treinado carregado
+        scaler: Scaler usado no backtest (ou None)
+        X: DataFrame com features
+        indicadores_esperados: Lista de colunas esperadas pelo modelo
+        min_confianca: float entre 0-1. Previsões abaixo disso retornam 'NEUTRO'
+
+    Retorna:
+        tuple: (sinal, confianca)
+            sinal: "🟢 COMPRA", "🔴 VENDA" ou "⚪ NEUTRO"
+            confianca: probabilidade da classe prevista (float)
+    """
+    import numpy as np
+    import pandas as pd
+
+    if X is None or X.empty:
+        return "⚪ NEUTRO", 0.0
+
+    # 1. Garantir ordem e presença das colunas
+    X_proc = X.copy()
+    for col in indicadores_esperados:
+        if col not in X_proc.columns:
+            X_proc[col] = 0.0
+    X_proc = X_proc[indicadores_esperados]
+
+    # 2. Sanitizar
+    X_proc = X_proc.replace([np.inf, -np.inf], 0).fillna(0)
+
+    # 3. Aplicar scaler se disponível
+    if scaler and hasattr(scaler, "transform"):
+        try:
+            X_proc = scaler.transform(X_proc)
+        except Exception as e:
+            print(f"[ERRO] Falha ao aplicar scaler: {e}")
+            return "⚪ NEUTRO", 0.0
+    else:
+        X_proc = X_proc.values
+
+    # 4. Prever com o modelo
+    try:
+        previsao = modelo.predict(X_proc)[0]
+        confianca = 0.5
+        if hasattr(modelo, "predict_proba"):
+            proba = modelo.predict_proba(X_proc)[0]
+            confianca = proba[int(previsao)]
+    except Exception as e:
+        print(f"[ERRO] Falha ao prever com o modelo: {e}")
+        return "⚪ NEUTRO", 0.0
+
+    # 5. Aplicar política de confiança
+    if confianca < min_confianca:
+        return "⚪ NEUTRO", confianca
+
+    if previsao == 1:
+        return "🟢 COMPRA", confianca
+    elif previsao == 0:
+        return "🔴 VENDA", confianca
+    else:
+        return "⚪ NEUTRO", confianca
